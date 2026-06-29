@@ -1,0 +1,3 @@
+[workspace]
+members = ["sdk", "macros"]
+resolver = "2"
