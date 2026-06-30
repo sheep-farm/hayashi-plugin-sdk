@@ -45,11 +45,13 @@ pub use error::HayashiError;
 pub use ffi::{extract_arg, parse_args};
 pub use value::{FromHayashi, HayashiValue, IntoHayashi};
 
+// Re-export do crate arrow para que plugins possam usar FFI sem adicioná-lo ao Cargo.toml
+pub use arrow;
+
 // Re-export do proc macro do sub-crate
 pub use hayashi_plugin_sdk_macros::hayashi_fn;
 
-/// Gera o símbolo `free_string` que o Hayashi chama para liberar a memória das
-/// strings retornadas pelas funções do plugin.
+/// Gera os símbolos FFI de liberação de memória necessários pelo host Hayashi.
 ///
 /// **Deve ser invocado exatamente uma vez** no crate raiz do plugin.
 ///
@@ -62,17 +64,33 @@ pub use hayashi_plugin_sdk_macros::hayashi_fn;
 macro_rules! hayashi_plugin {
     () => {
         /// Libera uma string alocada pelo plugin e retornada ao host via C ABI.
-        ///
-        /// Chamado automaticamente pelo Hayashi após consumir o valor retornado
-        /// por uma função de plugin.
         #[no_mangle]
         pub extern "C" fn free_string(ptr: *mut ::std::os::raw::c_char) {
             if !ptr.is_null() {
-                // SAFETY: `ptr` foi alocado por `CString::into_raw()` neste
-                // mesmo processo. O Hayashi garante que `free_string` é chamado
-                // exatamente uma vez por ponteiro retornado.
                 unsafe {
                     drop(::std::ffi::CString::from_raw(ptr));
+                }
+            }
+        }
+
+        /// Libera as estruturas FFI do Arrow alocadas no heap do guest e retornadas ao host.
+        #[no_mangle]
+        pub extern "C" fn free_arrow_pointers(
+            array_ptr: *mut $crate::arrow::ffi::FFI_ArrowArray,
+            schema_ptr: *mut $crate::arrow::ffi::FFI_ArrowSchema,
+        ) {
+            if !array_ptr.is_null() {
+                unsafe {
+                    let mut arr_box = ::std::boxed::Box::from_raw(array_ptr);
+                    arr_box.release = None;
+                    drop(arr_box);
+                }
+            }
+            if !schema_ptr.is_null() {
+                unsafe {
+                    let mut sch_box = ::std::boxed::Box::from_raw(schema_ptr);
+                    sch_box.release = None;
+                    drop(sch_box);
                 }
             }
         }

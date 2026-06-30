@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::HayashiError;
+use arrow::array::Array;
 
 // =============================================================================
 // HayashiValue
@@ -20,6 +21,7 @@ pub enum HayashiValue {
     Str(String),
     List(Vec<HayashiValue>),
     Dict(HashMap<String, HayashiValue>),
+    Arrow(usize, usize),
     Nil,
 }
 
@@ -33,6 +35,7 @@ impl HayashiValue {
             Self::Str(_) => "string",
             Self::List(_) => "list",
             Self::Dict(_) => "dict",
+            Self::Arrow(_, _) => "arrow_array",
             Self::Nil => "nil",
         }
     }
@@ -60,6 +63,12 @@ impl HayashiValue {
                     map.iter().map(|(k, v)| (k.clone(), v.to_serde())).collect();
                 serde_json::Value::Object(obj)
             }
+            Self::Arrow(arr_ptr, sch_ptr) => {
+                let mut map = serde_json::Map::new();
+                map.insert("__arrow_array_ptr__".to_string(), serde_json::json!(arr_ptr));
+                map.insert("__arrow_schema_ptr__".to_string(), serde_json::json!(sch_ptr));
+                serde_json::Value::Object(map)
+            }
         }
     }
 
@@ -81,11 +90,18 @@ impl HayashiValue {
                     .map(Self::from_serde)
                     .collect::<Result<_, _>>()?,
             ),
-            serde_json::Value::Object(obj) => Self::Dict(
-                obj.iter()
-                    .map(|(k, v)| Self::from_serde(v).map(|vv| (k.clone(), vv)))
-                    .collect::<Result<_, _>>()?,
-            ),
+            serde_json::Value::Object(obj) => {
+                if let (Some(arr_val), Some(sch_val)) = (obj.get("__arrow_array_ptr__"), obj.get("__arrow_schema_ptr__")) {
+                    if let (Some(arr_ptr), Some(sch_ptr)) = (arr_val.as_u64(), sch_val.as_u64()) {
+                        return Ok(Self::Arrow(arr_ptr as usize, sch_ptr as usize));
+                    }
+                }
+                Self::Dict(
+                    obj.iter()
+                        .map(|(k, v)| Self::from_serde(v).map(|vv| (k.clone(), vv)))
+                        .collect::<Result<_, _>>()?,
+                )
+            }
         })
     }
 }
@@ -192,12 +208,72 @@ impl FromHayashi for String {
 
 // --- Coleções ----------------------------------------------------------------
 
+fn arrow_to_hayashi_values(array: &arrow::array::ArrayRef) -> Result<Vec<HayashiValue>, HayashiError> {
+    let len = array.len();
+    let mut values = Vec::with_capacity(len);
+    
+    match array.data_type() {
+        arrow::datatypes::DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<arrow::array::Float64Array>()
+                .ok_or_else(|| HayashiError::Custom("failed to downcast Float64Array".into()))?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(HayashiValue::Nil);
+                } else {
+                    values.push(HayashiValue::Float(arr.value(i)));
+                }
+            }
+        }
+        arrow::datatypes::DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| HayashiError::Custom("failed to downcast Int64Array".into()))?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(HayashiValue::Nil);
+                } else {
+                    values.push(HayashiValue::Int(arr.value(i)));
+                }
+            }
+        }
+        arrow::datatypes::DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| HayashiError::Custom("failed to downcast BooleanArray".into()))?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(HayashiValue::Nil);
+                } else {
+                    values.push(HayashiValue::Bool(arr.value(i)));
+                }
+            }
+        }
+        arrow::datatypes::DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<arrow::array::StringArray>()
+                .ok_or_else(|| HayashiError::Custom("failed to downcast StringArray".into()))?;
+            for i in 0..len {
+                if arr.is_null(i) {
+                    values.push(HayashiValue::Nil);
+                } else {
+                    values.push(HayashiValue::Str(arr.value(i).to_string()));
+                }
+            }
+        }
+        other => return Err(HayashiError::Custom(format!("unsupported Arrow type for conversion: {:?}", other))),
+    }
+    
+    Ok(values)
+}
+
 impl<T: FromHayashi> FromHayashi for Vec<T> {
     fn from_hayashi(val: HayashiValue) -> Result<Self, HayashiError> {
         match val {
             HayashiValue::List(lst) => lst.into_iter().map(T::from_hayashi).collect(),
+            HayashiValue::Arrow(array_ptr, schema_ptr) => {
+                let array = <arrow::array::ArrayRef as FromHayashi>::from_hayashi(HayashiValue::Arrow(array_ptr, schema_ptr))?;
+                let values = arrow_to_hayashi_values(&array)?;
+                values.into_iter().map(T::from_hayashi).collect()
+            }
             other => Err(HayashiError::Type {
-                expected: "list".into(),
+                expected: "list or arrow_array".into(),
                 got: other.type_name().into(),
             }),
         }
@@ -348,3 +424,40 @@ impl IntoHayashi for HayashiValue {
         self
     }
 }
+
+// --- Arrow FFI ---------------------------------------------------------------
+
+impl FromHayashi for arrow::array::ArrayRef {
+    fn from_hayashi(val: HayashiValue) -> Result<Self, HayashiError> {
+        match val {
+            HayashiValue::Arrow(array_ptr, schema_ptr) => {
+                let array_ptr = array_ptr as *mut arrow::ffi::FFI_ArrowArray;
+                let schema_ptr = schema_ptr as *mut arrow::ffi::FFI_ArrowSchema;
+                unsafe {
+                    let array_data = arrow::ffi::from_ffi(std::ptr::read(array_ptr), &*schema_ptr)
+                        .map_err(|e| HayashiError::Custom(format!("failed to import Arrow array: {e}")))?;
+                    
+                    Ok(arrow::array::make_array(array_data))
+                }
+            }
+            other => Err(HayashiError::Type {
+                expected: "arrow_array".into(),
+                got: other.type_name().into(),
+            }),
+        }
+    }
+}
+
+impl IntoHayashi for arrow::array::ArrayRef {
+    fn into_hayashi(self) -> HayashiValue {
+        match arrow::ffi::to_ffi(&self.into_data()) {
+            Ok((ffi_array, ffi_schema)) => {
+                let array_ptr = Box::into_raw(Box::new(ffi_array));
+                let schema_ptr = Box::into_raw(Box::new(ffi_schema));
+                HayashiValue::Arrow(array_ptr as usize, schema_ptr as usize)
+            }
+            Err(_) => HayashiValue::Nil,
+        }
+    }
+}
+
