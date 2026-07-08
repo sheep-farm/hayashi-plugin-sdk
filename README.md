@@ -242,10 +242,60 @@ jobs:
           files: myplugin-${{ matrix.target }}.${{ matrix.ext }}
 ```
 
+## Modelos econométricos
+
+Quando um modelo estimado (e.g. resultado de `ols()`, `logit()`, `gmm()`) é
+passado para um plugin nativo, o Hayashi o serializa como `HayashiValue::Dict`
+com os seguintes campos:
+
+| Campo            | Tipo     | Descrição                                  |
+|------------------|----------|--------------------------------------------|
+| `__model_type__` | `Str`    | Tipo do modelo (`"ols"`, `"logit"`, etc.)  |
+| `variable`       | `List`   | Nomes das variáveis                        |
+| `coef`           | `List`   | Coeficientes estimados                     |
+| `std_err`        | `List`   | Erros padrão                               |
+| `t` ou `z`       | `List`   | Estatísticas t (OLS/IV) ou z (MLE)         |
+| `p_value`        | `List`   | P-valores                                  |
+| `conf_low`       | `List`   | Limite inferior do IC (OLS apenas)         |
+| `conf_high`      | `List`   | Limite superior do IC (OLS apenas)         |
+| `r2` / `pseudo_r2` | `Float` | R² ou pseudo-R²                          |
+| `n`              | `Float`  | Número de observações                      |
+| `aic`, `bic`     | `Float`  | Critérios de informação                    |
+| `log_lik`        | `Float`  | Log-likelihood                             |
+| `sigma`          | `Float`  | Erro padrão da regressão                   |
+
+Os campos de ajuste variam por tipo de modelo. Campos ausentes simplesmente
+não aparecem no dict.
+
+```rust
+use hayashi_plugin_sdk::{hayashi_fn, hayashi_plugin, HayashiValue};
+use std::collections::HashMap;
+
+#[hayashi_fn]
+pub fn n_obs(model: HayashiValue) -> String {
+    match &model {
+        HayashiValue::Dict(d) => {
+            if let Some(HayashiValue::Float(n)) = d.get("n") {
+                format!("Observations: {}", *n as i64)
+            } else {
+                "N/A".to_string()
+            }
+        }
+        _ => "not a model".to_string(),
+    }
+}
+
+hayashi_plugin!();
+```
+
+Modelos suportados: OLS, IV/2SLS, Logit/Probit, Panel FE/RE, GMM, Poisson,
+NegBin, GLM, Quantile, Tobit, Heckman, Ordered, Arellano-Bond, Ridge/Lasso/
+ElasticNet, RLM, Beta, GEE, ARIMA, GARCH.
+
 ## Limitações (v0.1)
 
 - Apenas parâmetros com nomes simples (sem destructuring)
-- DataFrames passados como `Dict` de listas — sem tipo `HayashiDataFrame` nativo
+- DataFrames passados como `Dict` de listas ou Arrow FFI — sem tipo `HayashiDataFrame` nativo
 - Sem suporte a parâmetros nomeados (`opt=value`) — use `Option<T>` posicional
 - Plugins WASM seguem protocolo diferente (ver `wasmi` em `plugin.rs` do Hayashi)
 
