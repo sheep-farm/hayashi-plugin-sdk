@@ -22,6 +22,34 @@ pub enum HayashiValue {
     List(Vec<HayashiValue>),
     Dict(HashMap<String, HayashiValue>),
     Arrow(usize, usize),
+    /// Geometria vetorial em Well-Known Text (WKT).
+    ///
+    /// É o tipo canônico para trocar dados geoespaciais entre plugins e o host.
+    /// O conteúdo é sempre uma string WKT válida, ex:
+    /// `"POLYGON ((0 0, 1 0, 1 1, 0 0))"`.
+    ///
+    /// Plugins geoespaciais devem aceitar e retornar `Geometry` em vez de
+    /// passar WKT como `Str`, garantindo que o host possa distinguir geometrias
+    /// de strings comuns e compor pipelines entre plugins sem conversão manual.
+    Geometry(String),
+    /// Output visual composável como spec Vega-Lite (JSON).
+    ///
+    /// Plugins de visualização devem retornar `Plot` em vez de PNG em base64
+    /// ou SVG como `Str`. O host decide como renderizar (terminal, browser,
+    /// arquivo) sem precisar que o plugin conheça o destino.
+    ///
+    /// `format` identifica o schema da spec: `"vega-lite"`, `"plotters-svg"`,
+    /// `"plotters-png-b64"`. O host pode ignorar formatos que não suporta.
+    ///
+    /// Layers adicionais podem ser adicionados ao mesmo `Plot` pelo host antes
+    /// de renderizar, viabilizando composição `plot + geom_line + geom_point`
+    /// sem round-trips de serialização.
+    Plot {
+        /// Especificação do plot (tipicamente JSON Vega-Lite ou SVG/PNG em b64).
+        spec: String,
+        /// Identificador do formato: `"vega-lite"`, `"plotters-svg"`, `"plotters-png-b64"`.
+        format: String,
+    },
     Nil,
 }
 
@@ -36,6 +64,8 @@ impl HayashiValue {
             Self::List(_) => "list",
             Self::Dict(_) => "dict",
             Self::Arrow(_, _) => "arrow_array",
+            Self::Geometry(_) => "geometry",
+            Self::Plot { .. } => "plot",
             Self::Nil => "nil",
         }
     }
@@ -69,6 +99,19 @@ impl HayashiValue {
                 map.insert("__arrow_schema_ptr__".to_string(), serde_json::json!(sch_ptr));
                 serde_json::Value::Object(map)
             }
+            // Geometry: marcador __geometry_wkt__ para o host distinguir de Str
+            Self::Geometry(wkt) => {
+                let mut map = serde_json::Map::new();
+                map.insert("__geometry_wkt__".to_string(), serde_json::json!(wkt));
+                serde_json::Value::Object(map)
+            }
+            // Plot: marcador __plot_spec__ + __plot_format__
+            Self::Plot { spec, format } => {
+                let mut map = serde_json::Map::new();
+                map.insert("__plot_spec__".to_string(), serde_json::json!(spec));
+                map.insert("__plot_format__".to_string(), serde_json::json!(format));
+                serde_json::Value::Object(map)
+            }
         }
     }
 
@@ -91,9 +134,25 @@ impl HayashiValue {
                     .collect::<Result<_, _>>()?,
             ),
             serde_json::Value::Object(obj) => {
+                // Arrow FFI pointers
                 if let (Some(arr_val), Some(sch_val)) = (obj.get("__arrow_array_ptr__"), obj.get("__arrow_schema_ptr__")) {
                     if let (Some(arr_ptr), Some(sch_ptr)) = (arr_val.as_u64(), sch_val.as_u64()) {
                         return Ok(Self::Arrow(arr_ptr as usize, sch_ptr as usize));
+                    }
+                }
+                // Geometry (WKT)
+                if let Some(wkt_val) = obj.get("__geometry_wkt__") {
+                    if let Some(wkt) = wkt_val.as_str() {
+                        return Ok(Self::Geometry(wkt.to_owned()));
+                    }
+                }
+                // Plot
+                if let (Some(spec_val), Some(fmt_val)) = (obj.get("__plot_spec__"), obj.get("__plot_format__")) {
+                    if let (Some(spec), Some(format)) = (spec_val.as_str(), fmt_val.as_str()) {
+                        return Ok(Self::Plot {
+                            spec: spec.to_owned(),
+                            format: format.to_owned(),
+                        });
                     }
                 }
                 Self::Dict(
@@ -311,6 +370,173 @@ impl<T: FromHayashi> FromHayashi for Option<T> {
 impl FromHayashi for HayashiValue {
     fn from_hayashi(val: HayashiValue) -> Result<Self, HayashiError> {
         Ok(val)
+    }
+}
+
+// --- Geometry ----------------------------------------------------------------
+
+/// Wrapper de nova tipagem para geometria WKT.
+///
+/// Use-o como parâmetro ou retorno em funções marcadas com `#[hayashi_fn]`
+/// para sinalizar explicitamente ao host que o valor é geoespacial, não uma
+/// string genérica.
+///
+/// # Exemplo
+///
+/// ```rust,ignore
+/// #[hayashi_fn]
+/// pub fn bbox(geom: Geometry) -> Geometry {
+///     // ...
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct Geometry(pub String);
+
+impl Geometry {
+    /// Cria uma geometria a partir de um WKT string.
+    pub fn from_wkt(wkt: impl Into<String>) -> Self {
+        Self(wkt.into())
+    }
+
+    /// Retorna o WKT da geometria.
+    pub fn wkt(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromHayashi for Geometry {
+    fn from_hayashi(val: HayashiValue) -> Result<Self, HayashiError> {
+        match val {
+            HayashiValue::Geometry(wkt) => Ok(Geometry(wkt)),
+            // Aceita Str como fallback para compatibilidade com plugins pré-Geometry
+            HayashiValue::Str(s) => Ok(Geometry(s)),
+            other => Err(HayashiError::Type {
+                expected: "geometry".into(),
+                got: other.type_name().into(),
+            }),
+        }
+    }
+}
+
+impl IntoHayashi for Geometry {
+    fn into_hayashi(self) -> HayashiValue {
+        HayashiValue::Geometry(self.0)
+    }
+}
+
+// --- Plot --------------------------------------------------------------------
+
+/// Wrapper para output visual composável.
+///
+/// Use como tipo de retorno em funções de visualização marcadas com
+/// `#[hayashi_fn]`. O host decide como renderizar sem que o plugin precise
+/// conhecer o destino (terminal, arquivo, browser).
+///
+/// # Exemplo
+///
+/// ```rust,ignore
+/// #[hayashi_fn]
+/// pub fn scatter(df: ArrayRef, x: String, y: String) -> Plot {
+///     let spec = build_vega_lite_spec(&df, &x, &y);
+///     Plot::vega_lite(spec)
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plot {
+    pub spec: String,
+    pub format: String,
+}
+
+impl Plot {
+    /// Cria um `Plot` com spec Vega-Lite.
+    pub fn vega_lite(spec: impl Into<String>) -> Self {
+        Self { spec: spec.into(), format: "vega-lite".into() }
+    }
+
+    /// Cria um `Plot` com SVG gerado pelo Plotters.
+    pub fn plotters_svg(svg: impl Into<String>) -> Self {
+        Self { spec: svg.into(), format: "plotters-svg".into() }
+    }
+
+    /// Cria um `Plot` com PNG em base64 gerado pelo Plotters.
+    pub fn plotters_png_b64(b64: impl Into<String>) -> Self {
+        Self { spec: b64.into(), format: "plotters-png-b64".into() }
+    }
+}
+
+impl FromHayashi for Plot {
+    fn from_hayashi(val: HayashiValue) -> Result<Self, HayashiError> {
+        match val {
+            HayashiValue::Plot { spec, format } => Ok(Plot { spec, format }),
+            other => Err(HayashiError::Type {
+                expected: "plot".into(),
+                got: other.type_name().into(),
+            }),
+        }
+    }
+}
+
+impl IntoHayashi for Plot {
+    fn into_hayashi(self) -> HayashiValue {
+        HayashiValue::Plot { spec: self.spec, format: self.format }
+    }
+}
+
+// --- Seed --------------------------------------------------------------------
+
+#[cfg(feature = "seed")]
+/// Semente RNG injetada pelo host quando o usuário chama `set_seed(N)`.
+///
+/// O host injeta `__seed__` como último argumento oculto nas chamadas a
+/// plugins que declaram `seed: Option<Seed>` como parâmetro final.
+///
+/// Requer a feature `seed` do SDK (ativa `rand 0.10`):
+/// ```toml
+/// hayashi-plugin-sdk = { version = "0.1", features = ["seed"] }
+/// ```
+///
+/// # Exemplo
+///
+/// ```rust,ignore
+/// #[hayashi_fn]
+/// pub fn monte_carlo(n: i64, seed: Option<Seed>) -> Vec<f64> {
+///     let mut rng = seed
+///         .map(|s| s.into_rng())
+///         .unwrap_or_else(|| rand::rngs::StdRng::from_entropy());
+///     // ...
+/// }
+/// ```
+#[cfg(feature = "seed")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Seed(pub u64);
+
+#[cfg(feature = "seed")]
+impl Seed {
+    /// Cria um `StdRng` derivado desta semente.
+    pub fn into_rng(self) -> rand::rngs::StdRng {
+        use rand::SeedableRng;
+        rand::rngs::StdRng::seed_from_u64(self.0)
+    }
+}
+
+#[cfg(feature = "seed")]
+impl FromHayashi for Seed {
+    fn from_hayashi(val: HayashiValue) -> Result<Self, HayashiError> {
+        match val {
+            HayashiValue::Int(i) => Ok(Seed(i as u64)),
+            HayashiValue::Float(f) => Ok(Seed(f as u64)),
+            other => Err(HayashiError::Type {
+                expected: "seed (int)".into(),
+                got: other.type_name().into(),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "seed")]
+impl IntoHayashi for Seed {
+    fn into_hayashi(self) -> HayashiValue {
+        HayashiValue::Int(self.0 as i64)
     }
 }
 

@@ -43,7 +43,10 @@ pub mod value;
 // Re-exports públicos — o autor do plugin só precisa importar o crate raiz.
 pub use error::HayashiError;
 pub use ffi::{extract_arg, parse_args};
-pub use value::{FromHayashi, HayashiValue, IntoHayashi};
+pub use value::{FromHayashi, Geometry, HayashiValue, IntoHayashi, Plot};
+
+#[cfg(feature = "seed")]
+pub use value::Seed;
 
 // Re-export do crate arrow para que plugins possam usar FFI sem adicioná-lo ao Cargo.toml
 pub use arrow;
