@@ -462,6 +462,16 @@ impl Plot {
     pub fn plotters_png_b64(b64: impl Into<String>) -> Self {
         Self { spec: b64.into(), format: "plotters-png-b64".into() }
     }
+
+    /// Cria um `Plot` com conteúdo LaTeX para renderização no Jupyter.
+    pub fn latex(spec: impl Into<String>) -> Self {
+        Self { spec: spec.into(), format: "latex".into() }
+    }
+
+    /// Cria um `Plot` com tabela Markdown para renderização no Jupyter.
+    pub fn markdown(spec: impl Into<String>) -> Self {
+        Self { spec: spec.into(), format: "markdown".into() }
+    }
 }
 
 impl FromHayashi for Plot {
